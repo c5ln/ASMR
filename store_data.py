@@ -8,6 +8,7 @@ import torch
 from dataset import (
     MASK_MAX_FRAC,
     N_MASKS_PER_AXIS,
+    TARGET_SIZE,
     _melspec,
     _normalize,
     _time_shift,
@@ -57,11 +58,19 @@ def build_augmented_dataset(wav_dir: str, n_augments: int, seed: int):
         for _ in range(n_augments):
             s = _time_shift(stroke.copy())
 
-            specs = np.stack([_melspec(s[c]) for c in range(2)], axis=0)
+            mono = (s[0] + s[1]) / 2
+            specs = np.stack([_melspec(s[0]), _melspec(s[1]), _melspec(mono)], axis=0)
             _normalize(specs)
 
             t = torch.from_numpy(specs.copy())   # .copy() avoids shared-memory aliasing
             t = _spec_augment_corrected(t)
+
+            t = torch.nn.functional.interpolate(
+                t.unsqueeze(0),
+                size=(TARGET_SIZE, TARGET_SIZE),
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(0)
 
             all_specs.append(t)
             all_labels.append(label)
@@ -92,7 +101,7 @@ def main():
     print(f"\n{'─' * 54}")
     print(f"  Saved     : {save_path}")
     print(f"  Samples   : {len(labels):,}  (36 keys × 25 × {args.n_augments})")
-    print(f"  Spec shape: {tuple(specs.shape)}  (N, C, H, W)")
+    print(f"  Spec shape: {tuple(specs.shape)}  (N, 3, {TARGET_SIZE}, {TARGET_SIZE})")
     print(f"  Value range: [{specs.min():.3f}, {specs.max():.3f}]")
     print(f"  File size : {size_mb:.1f} MB")
     print(f"{'─' * 54}")

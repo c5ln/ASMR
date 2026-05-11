@@ -113,6 +113,43 @@ Requires Python 3.9+ and PyTorch 2.0+. GPU recommended.
 
 ## Usage
 
+### Pre-generate Augmented Dataset (optional)
+
+`store_data.py` pre-generates augmented mel-spectrograms and saves them to disk as a single `.pt` file containing both spectrograms and ground-truth labels.
+
+```bash
+python store_data.py
+```
+
+Key arguments:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--wav_dir` | `MBPWavs` | Path to keystroke WAV files |
+| `--n_augments` | `10` | Augmented versions per keystroke |
+| `--save_dir` | `augment_data` | Output directory |
+| `--seed` | `42` | Random seed for reproducibility |
+
+Output file: `augment_data/dataset.pt`
+
+```python
+data = torch.load('augment_data/dataset.pt')
+data['specs']   # torch.Tensor  shape (N, 3, 224, 224)  — L / R / mono-mix channels
+data['labels']  # torch.Tensor  shape (N,)  dtype=int64  — class index per sample
+```
+
+> **Note:** `store_data.py` produces **3-channel** spectrograms (left, right, mono mix), whereas the main training pipeline (`train.py`) uses **2-channel** (left, right only). If you load `dataset.pt` for training, adjust `in_chans` accordingly.
+
+Estimated file sizes for common `--n_augments` values (36 keys × 25 × N, float32):
+
+| `--n_augments` | Samples | File size |
+|---|---|---|
+| 10 | 9,000 | ~5 GB |
+| 20 | 18,000 | ~10 GB |
+| 30 | 27,000 | ~15 GB |
+
+---
+
 ### Train
 
 ```bash
@@ -164,6 +201,9 @@ python model.py
 ├── dataset.py              # Keystroke isolation, mel-spectrogram, Dataset/DataLoader
 ├── model.py                # MaxViT-S wrapper (timm)
 ├── train.py                # Training loop, evaluation, plots
+├── store_data.py           # Pre-generate augmented spectrograms → augment_data/dataset.pt
+├── augment_data/
+│   └── dataset.pt          # Pre-generated dataset: {'specs': (N,3,224,224), 'labels': (N,)}
 ├── requirements.txt
 └── checkpoints/            # Auto-created during training
 ```

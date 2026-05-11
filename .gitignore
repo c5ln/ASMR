@@ -1,3 +1,6 @@
+# Pre-generated augmented dataset (too large for GitHub LFS; regenerate with store_data.py)
+augment_data/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
