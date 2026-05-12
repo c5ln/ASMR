@@ -115,7 +115,7 @@ def main(args):
     print(f'Device: {device}  |  AMP: {use_amp}')
 
     train_loader, val_loader, test_loader, n_classes = get_dataloaders(
-        args.wav_dir, batch_size=args.batch_size
+        args.wav_dir, batch_size=args.batch_size, num_workers=args.num_workers
     )
 
     model = build_model(num_classes=n_classes).to(device)
@@ -176,5 +176,6 @@ if __name__ == '__main__':
     p.add_argument('--epochs',     type=int,   default=200)
     p.add_argument('--lr',         type=float, default=1e-3)
     p.add_argument('--warmup',     type=int,   default=20,  help='Linear warmup 에폭 수')
-    p.add_argument('--sigma',      type=float, default=1.0, help='Gaussian smoothing σ')
+    p.add_argument('--sigma',       type=float, default=1.0, help='Gaussian smoothing σ')
+    p.add_argument('--num_workers', type=int,   default=2,   help='DataLoader 병렬 worker 수')
     main(p.parse_args())

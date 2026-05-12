@@ -222,7 +222,7 @@ class KeystrokeDataset(Dataset):
 
 
 def get_dataloaders(wav_dir, batch_size=16, val_ratio=0.1, test_ratio=0.1, seed=42,
-                    aug_factor=25):
+                    aug_factor=25, num_workers=0):
     """
     Load → isolate → split randomly (paper: "Data Split: Random") → return DataLoaders.
     Returns (train_loader, val_loader, test_loader, num_classes).
@@ -250,8 +250,9 @@ def get_dataloaders(wav_dir, batch_size=16, val_ratio=0.1, test_ratio=0.1, seed=
             KeystrokeDataset(data, mode=mode, aug_factor=factor),
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=0,   # 0: avoid NumPy 2.x / system-torch compatibility issue
+            num_workers=num_workers,
             pin_memory=True,
+            persistent_workers=num_workers > 0,
         )
 
     return loaders['train'], loaders['val'], loaders['test'], len(KEYS)
