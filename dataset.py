@@ -19,7 +19,7 @@ N_MELS         = 64
 N_FFT          = 1024
 HOP_LENGTH     = 225
 N_TIME_FRAMES  = 64     # crop mel-spectrogram time axis to this
-TARGET_SIZE    = 224   # pretrained ConvNextV2 기대 입력 크기
+TARGET_SIZE    = 256   # pretrained MobileViT-XXS 기대 입력 크기
 
 TIMESHIFT_FRAC    = 0.1   # ± 10 % — BEFORE=2400이므로 max_shift=1440 < 2400, wrap-around 없음
 MASK_MAX_FRAC     = 0.15  # each mask up to 15 % of axis length
