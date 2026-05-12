@@ -19,10 +19,10 @@ N_MELS         = 64
 N_FFT          = 1024
 HOP_LENGTH     = 225
 N_TIME_FRAMES  = 64     # crop mel-spectrogram time axis to this
-TARGET_SIZE    = 224    # resize for MaxViT-S (needs ≥ 112 input)
+TARGET_SIZE    = 224   # pretrained ConvNextV2 기대 입력 크기
 
-TIMESHIFT_FRAC    = 0.4   # ± 40 %
-MASK_MAX_FRAC     = 0.1   # each mask up to 10 % of axis length
+TIMESHIFT_FRAC    = 0.1   # ± 10 % — BEFORE=2400이므로 max_shift=1440 < 2400, wrap-around 없음
+MASK_MAX_FRAC     = 0.15  # each mask up to 15 % of axis length
 N_MASKS_PER_AXIS  = 2
 
 
@@ -158,15 +158,15 @@ def _spec_augment(spec):
     _, F, T = spec.shape
 
     for _ in range(N_MASKS_PER_AXIS):
-        # frequency mask
+        # frequency mask — fill with 0 (묵음, 정규화 후 최솟값)
         f_w = random.randint(1, max(1, int(MASK_MAX_FRAC * F)))
         f0  = random.randint(0, F - f_w)
-        spec[:, f0:f0 + f_w, :] = spec[:, f0:f0 + f_w, :].mean()
+        spec[:, f0:f0 + f_w, :] = 0.0
 
-        # time mask
+        # time mask — fill with 0
         t_w = random.randint(1, max(1, int(MASK_MAX_FRAC * T)))
         t0  = random.randint(0, T - t_w)
-        spec[:, :, t0:t0 + t_w] = spec[:, :, t0:t0 + t_w].mean()
+        spec[:, :, t0:t0 + t_w] = 0.0
 
     return spec
 
@@ -181,19 +181,21 @@ class KeystrokeDataset(Dataset):
       val/test :            melspec → normalize → tensor              → resize 224
     """
 
-    def __init__(self, data, mode='train'):
+    def __init__(self, data, mode='train', aug_factor=1):
         """
-        data : list of (label_int, ndarray(2, KEYSTROKE_LEN))
-        mode : 'train' | 'val' | 'test'
+        data       : list of (label_int, ndarray(2, KEYSTROKE_LEN))
+        mode       : 'train' | 'val' | 'test'
+        aug_factor : train 샘플을 몇 배로 늘릴지 (train 전용, val/test는 무시)
         """
-        self.data = data
-        self.mode = mode
+        self.data       = data
+        self.mode       = mode
+        self.aug_factor = aug_factor if mode == 'train' else 1
 
     def __len__(self):
-        return len(self.data)
+        return len(self.data) * self.aug_factor
 
     def __getitem__(self, idx):
-        label, stroke = self.data[idx]
+        label, stroke = self.data[idx % len(self.data)]
         stroke = stroke.copy()   # (2, KEYSTROKE_LEN)
 
         if self.mode == 'train':
@@ -208,7 +210,7 @@ class KeystrokeDataset(Dataset):
         if self.mode == 'train':
             specs = _spec_augment(specs)
 
-        # resize to (2, TARGET_SIZE, TARGET_SIZE) for MaxViT-S
+        # resize to (2, TARGET_SIZE, TARGET_SIZE) for ConvNextV2
         specs = torch.nn.functional.interpolate(
             specs.unsqueeze(0),
             size=(TARGET_SIZE, TARGET_SIZE),
@@ -219,7 +221,8 @@ class KeystrokeDataset(Dataset):
         return specs, torch.tensor(label, dtype=torch.long)
 
 
-def get_dataloaders(wav_dir, batch_size=16, val_ratio=0.1, test_ratio=0.1, seed=42):
+def get_dataloaders(wav_dir, batch_size=16, val_ratio=0.1, test_ratio=0.1, seed=42,
+                    aug_factor=25):
     """
     Load → isolate → split randomly (paper: "Data Split: Random") → return DataLoaders.
     Returns (train_loader, val_loader, test_loader, num_classes).
@@ -235,15 +238,16 @@ def get_dataloaders(wav_dir, batch_size=16, val_ratio=0.1, test_ratio=0.1, seed=
         random_state=seed
     )
     print(f"Split → train:{len(train_data)}  val:{len(val_data)}  test:{len(test_data)}")
+    print(f"Aug   → train:{len(train_data) * aug_factor} (×{aug_factor})  val:{len(val_data)}  test:{len(test_data)}")
 
     loaders = {}
-    for name, data, mode, shuffle in [
-        ('train', train_data, 'train', True),
-        ('val',   val_data,   'val',   False),
-        ('test',  test_data,  'test',  False),
+    for name, data, mode, shuffle, factor in [
+        ('train', train_data, 'train', True,  aug_factor),
+        ('val',   val_data,   'val',   False, 1),
+        ('test',  test_data,  'test',  False, 1),
     ]:
         loaders[name] = DataLoader(
-            KeystrokeDataset(data, mode=mode),
+            KeystrokeDataset(data, mode=mode, aug_factor=factor),
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=0,   # 0: avoid NumPy 2.x / system-torch compatibility issue
@@ -264,7 +268,7 @@ if __name__ == '__main__':
 
     batch, labels = next(iter(train_loader))
     print(f"\nSanity check:")
-    print(f"  batch shape : {batch.shape}")   # (4, 2, 224, 224)
+    print(f"  batch shape : {batch.shape}")   # (4, 2, 64, 64)
     print(f"  label shape : {labels.shape}")  # (4,)
     print(f"  value range : [{batch.min():.3f}, {batch.max():.3f}]")
     print(f"  labels      : {labels.tolist()}")

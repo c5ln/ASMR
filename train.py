@@ -1,237 +1,180 @@
 import argparse
-import csv
 import os
 
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import classification_report, confusion_matrix
+import torch.nn.functional as F
+from tqdm import tqdm
 
 from dataset import KEYS, get_dataloaders
-from model import build_maxvit_s
+from model import build_model
+
+# ── QWERTY 2D 좌표 (row, col) — 행 stagger 반영 ─────────────────────────────
+# 숫자행: 0~9 (offset 0)
+# Q행   : Q~P (offset 0)
+# A행   : A~L (offset 0.5)
+# Z행   : Z~M (offset 1.0)
+_KEY_POS = {
+    '1':(0,0),'2':(0,1),'3':(0,2),'4':(0,3),'5':(0,4),
+    '6':(0,5),'7':(0,6),'8':(0,7),'9':(0,8),'0':(0,9),
+    'Q':(1,0),'W':(1,1),'E':(1,2),'R':(1,3),'T':(1,4),
+    'Y':(1,5),'U':(1,6),'I':(1,7),'O':(1,8),'P':(1,9),
+    'A':(2,0.5),'S':(2,1.5),'D':(2,2.5),'F':(2,3.5),'G':(2,4.5),
+    'H':(2,5.5),'J':(2,6.5),'K':(2,7.5),'L':(2,8.5),
+    'Z':(3,1.0),'X':(3,2.0),'C':(3,3.0),'V':(3,4.0),'B':(3,5.0),
+    'N':(3,6.0),'M':(3,7.0),
+}
 
 
-# ── Argument Parsing ──────────────────────────────────────────────────────────
-
-def parse_args():
-    p = argparse.ArgumentParser(description='Train MaxViT-S on MBP keystroke data')
-    p.add_argument('--wav_dir',         default='MBPWavs')
-    p.add_argument('--epochs',          type=int,   default=100)
-    p.add_argument('--batch_size',      type=int,   default=16)
-    p.add_argument('--lr',              type=float, default=5e-4)
-    p.add_argument('--val_every',       type=int,   default=5)
-    p.add_argument('--seed',            type=int,   default=42)
-    p.add_argument('--checkpoint_dir',  default='checkpoints')
-    return p.parse_args()
+def _build_soft_label_matrix(keys: list, sigma: float) -> torch.Tensor:
+    """keys 순서대로 (n, n) Gaussian soft-label 행렬 반환."""
+    pos = np.array([_KEY_POS[k] for k in keys], dtype=np.float32)   # (n, 2)
+    diff = pos[:, None, :] - pos[None, :, :]                         # (n, n, 2)
+    d2   = (diff ** 2).sum(-1)                                        # (n, n)
+    w    = np.exp(-d2 / (2 * sigma ** 2))
+    w   /= w.sum(axis=1, keepdims=True)
+    return torch.tensor(w, dtype=torch.float32)
 
 
-# ── Train / Eval Helpers ──────────────────────────────────────────────────────
+class GaussianLabelSmoothingLoss(nn.Module):
+    """
+    정답 키를 중심으로 Gaussian 분포를 갖는 soft label로 KL divergence 계산.
+    인접 키로 오분류할수록 적은 penalty, 먼 키로 오분류할수록 큰 penalty.
+    """
+    def __init__(self, keys: list, sigma: float = 1.0):
+        super().__init__()
+        mat = _build_soft_label_matrix(keys, sigma)
+        self.register_buffer('label_dist', mat)   # (n_classes, n_classes)
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        soft     = self.label_dist[targets]               # (B, n_classes)
+        log_prob = F.log_softmax(logits, dim=-1)
+        return F.kl_div(log_prob, soft, reduction='batchmean')
+
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+def topk_accuracy(output: torch.Tensor, target: torch.Tensor, topk=(1, 5)):
+    with torch.no_grad():
+        maxk = max(topk)
+        B = target.size(0)
+        _, pred = output.topk(maxk, dim=1, largest=True, sorted=True)
+        correct = pred.t().eq(target.view(1, -1).expand_as(pred.t()))
+        return [correct[:k].reshape(-1).float().sum().mul_(100.0 / B).item()
+                for k in topk]
+
+
+# ── Train / Eval ─────────────────────────────────────────────────────────────
+
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_amp):
     model.train()
-    total_loss, correct, total = 0.0, 0, 0
-    for specs, labels in loader:
+    total_loss = 0.0
+    for specs, labels in tqdm(loader, desc='  train', leave=False):
         specs, labels = specs.to(device), labels.to(device)
         optimizer.zero_grad()
-        logits = model(specs)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * specs.size(0)
-        correct    += (logits.argmax(1) == labels).sum().item()
-        total      += specs.size(0)
-    return total_loss / total, correct / total
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            loss = criterion(model(specs), labels)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        total_loss += loss.item()
+    return total_loss / len(loader)
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, use_amp):
     model.eval()
-    total_loss, correct, total = 0.0, 0, 0
+    total_loss = top1_sum = top5_sum = n = 0
     for specs, labels in loader:
         specs, labels = specs.to(device), labels.to(device)
-        logits = model(specs)
-        loss = criterion(logits, labels)
-        total_loss += loss.item() * specs.size(0)
-        correct    += (logits.argmax(1) == labels).sum().item()
-        total      += specs.size(0)
-    return total_loss / total, correct / total
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            out = model(specs)
+        total_loss += criterion(out, labels).item()
+        t1, t5 = topk_accuracy(out, labels)
+        top1_sum += t1 * labels.size(0)
+        top5_sum += t5 * labels.size(0)
+        n += labels.size(0)
+    return total_loss / len(loader), top1_sum / n, top5_sum / n
 
 
-@torch.no_grad()
-def collect_predictions(model, loader, device):
-    model.eval()
-    all_preds, all_labels = [], []
-    for specs, labels in loader:
-        preds = model(specs.to(device)).argmax(1).cpu()
-        all_preds.append(preds)
-        all_labels.append(labels)
-    return torch.cat(all_preds).numpy(), torch.cat(all_labels).numpy()
+# ── LR schedule: linear warmup + cosine decay ────────────────────────────────
+
+def _lr_lambda(epoch, warmup, total):
+    if epoch < warmup:
+        return (epoch + 1) / warmup
+    progress = (epoch - warmup) / max(1, total - warmup)
+    return 0.5 * (1.0 + np.cos(np.pi * progress))
 
 
-# ── Plotting ──────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
-def plot_training_curves(log_path, out_path):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+def main(args):
+    device  = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_amp = device.type == 'cuda'
+    print(f'Device: {device}  |  AMP: {use_amp}')
 
-    epochs, train_acc, val_acc = [], [], []
-    with open(log_path) as f:
-        for row in csv.DictReader(f):
-            epochs.append(int(row['epoch']))
-            train_acc.append(float(row['train_acc']))
-            val_acc.append(float(row['val_acc']) if row['val_acc'] else None)
-
-    val_x = [e for e, v in zip(epochs, val_acc) if v is not None]
-    val_y = [v for v in val_acc if v is not None]
-
-    plt.figure(figsize=(10, 4))
-    plt.plot(epochs, train_acc, label='train acc', alpha=0.7)
-    plt.plot(val_x, val_y, label='val acc')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.title('MaxViT-S Training on MBP Keystrokes')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=100)
-    plt.close()
-    print(f"Training curves saved → {out_path}")
-
-
-def plot_confusion_matrix(cm, out_path):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(14, 12))
-    im = ax.imshow(cm, cmap='Blues')
-    plt.colorbar(im, ax=ax)
-    ax.set_xticks(range(len(KEYS)))
-    ax.set_yticks(range(len(KEYS)))
-    ax.set_xticklabels(KEYS, fontsize=8)
-    ax.set_yticklabels(KEYS, fontsize=8)
-    ax.set_xlabel('Predicted')
-    ax.set_ylabel('True')
-    ax.set_title('Confusion Matrix (test set)')
-
-    for i in range(len(KEYS)):
-        for j in range(len(KEYS)):
-            if cm[i, j] > 0:
-                ax.text(j, i, cm[i, j], ha='center', va='center', fontsize=7,
-                        color='white' if cm[i, j] > cm.max() * 0.5 else 'black')
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=100)
-    plt.close()
-    print(f"Confusion matrix saved → {out_path}")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main():
-    args = parse_args()
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device : {device}")
-
-    # ── Data ──────────────────────────────────────────────────────────────────
     train_loader, val_loader, test_loader, n_classes = get_dataloaders(
-        args.wav_dir, batch_size=args.batch_size, seed=args.seed
+        args.wav_dir, batch_size=args.batch_size
     )
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    model = build_maxvit_s(num_classes=n_classes, in_chans=2).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"MaxViT-S  params : {n_params / 1e6:.1f}M")
+    model = build_model(num_classes=n_classes).to(device)
+    print(f'Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
 
-    # ── Optimizer & Scheduler ─────────────────────────────────────────────────
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    # Linear decay: lr goes from 5e-4 → 5e-6 over all epochs (×0.01 factor)
-    scheduler = torch.optim.lr_scheduler.LinearLR(
+    criterion = GaussianLabelSmoothingLoss(KEYS, sigma=args.sigma).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        start_factor=1.0,
-        end_factor=0.01,
-        total_iters=args.epochs,
+        lr_lambda=lambda e: _lr_lambda(e, args.warmup, args.epochs)
     )
-    criterion = nn.CrossEntropyLoss()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    # ── Training Loop ─────────────────────────────────────────────────────────
-    best_val_acc = 0.0
-    log_path = os.path.join(args.checkpoint_dir, 'training_log.csv')
-
-    with open(log_path, 'w', newline='') as f:
-        csv.DictWriter(f, fieldnames=['epoch', 'train_loss', 'train_acc', 'val_acc']
-                       ).writeheader()
-
-    print(f"\nTraining for {args.epochs} epochs  (validate every {args.val_every})\n")
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    best_top1 = 0.0
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, criterion, device
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler, device, use_amp
+        )
+        val_loss, val_top1, val_top5 = evaluate(
+            model, val_loader, criterion, device, use_amp
         )
         scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
 
-        val_acc = 0.0
-        if epoch % args.val_every == 0 or epoch == 1:
-            _, val_acc = evaluate(model, val_loader, criterion, device)
+        lr_now = optimizer.param_groups[0]['lr']
+        print(
+            f'Epoch {epoch:3d}/{args.epochs} | '
+            f'lr={lr_now:.2e} | '
+            f'train={train_loss:.4f} | '
+            f'val={val_loss:.4f} | '
+            f'top1={val_top1:.1f}% | '
+            f'top5={val_top5:.1f}%'
+        )
 
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                torch.save(
-                    model.state_dict(),
-                    os.path.join(args.checkpoint_dir, 'best.pt'),
-                )
-
-            print(
-                f"[{epoch:5d}/{args.epochs}]  "
-                f"loss={train_loss:.4f}  train={train_acc:.4f}  "
-                f"val={val_acc:.4f}  best={best_val_acc:.4f}  "
-                f"lr={current_lr:.2e}"
+        if val_top1 > best_top1:
+            best_top1 = val_top1
+            torch.save(
+                {'epoch': epoch, 'model': model.state_dict(), 'val_top1': val_top1},
+                os.path.join(args.ckpt_dir, 'best_model.pt')
             )
 
-        with open(log_path, 'a', newline='') as f:
-            csv.DictWriter(f, fieldnames=['epoch', 'train_loss', 'train_acc', 'val_acc']
-                           ).writerow({
-                               'epoch':      epoch,
-                               'train_loss': round(train_loss, 6),
-                               'train_acc':  round(train_acc, 6),
-                               'val_acc':    round(val_acc, 6),
-                           })
-
-    # ── Step 7: Final Evaluation ──────────────────────────────────────────────
-    print(f"\nBest validation accuracy : {best_val_acc:.4f} ({best_val_acc*100:.2f}%)")
-    print("Loading best checkpoint for test evaluation...")
-    model.load_state_dict(
-        torch.load(os.path.join(args.checkpoint_dir, 'best.pt'), map_location=device)
+    # ── 최종 테스트 평가 ──────────────────────────────────────────────────────
+    ckpt = torch.load(
+        os.path.join(args.ckpt_dir, 'best_model.pt'), map_location=device
     )
-
-    _, test_acc = evaluate(model, test_loader, criterion, device)
-    print(f"Test accuracy            : {test_acc:.4f} ({test_acc*100:.2f}%)\n")
-
-    preds, labels = collect_predictions(model, test_loader, device)
-    print("Classification Report:")
-    print(classification_report(labels, preds, target_names=KEYS, digits=4))
-
-    cm = confusion_matrix(labels, preds)
-    np.save(os.path.join(args.checkpoint_dir, 'confusion_matrix.npy'), cm)
-
-    # Plots (require matplotlib; skip if unavailable)
-    try:
-        plot_training_curves(
-            log_path,
-            os.path.join(args.checkpoint_dir, 'training_curves.png'),
-        )
-        plot_confusion_matrix(
-            cm,
-            os.path.join(args.checkpoint_dir, 'confusion_matrix.png'),
-        )
-    except Exception as e:
-        print(f"Plotting skipped: {e}")
+    model.load_state_dict(ckpt['model'])
+    _, test_top1, test_top5 = evaluate(model, test_loader, criterion, device, use_amp)
+    print(f'\n[Test] top1={test_top1:.1f}%  top5={test_top5:.1f}%  '
+          f'(best val epoch={ckpt["epoch"]})')
 
 
 if __name__ == '__main__':
-    main()
+    p = argparse.ArgumentParser(description='ConvNextV2 Acoustic Side-Channel Attack')
+    p.add_argument('--wav_dir',    default='MBPWavs',      help='wav 파일 디렉터리')
+    p.add_argument('--ckpt_dir',   default='checkpoints',  help='체크포인트 저장 경로')
+    p.add_argument('--batch_size', type=int,   default=32)
+    p.add_argument('--epochs',     type=int,   default=200)
+    p.add_argument('--lr',         type=float, default=1e-3)
+    p.add_argument('--warmup',     type=int,   default=20,  help='Linear warmup 에폭 수')
+    p.add_argument('--sigma',      type=float, default=1.0, help='Gaussian smoothing σ')
+    main(p.parse_args())

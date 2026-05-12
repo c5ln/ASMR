@@ -1,219 +1,177 @@
-# Implementation Plan: Keyboard Acoustic Side Channel Attack with MaxViT-S
+# 구현 계획: Acoustic Side Channel Attack with ConvNextV2
 
-## Overview
+## 현재 상태
 
-Replicate "A Practical Deep Learning-Based Acoustic Side Channel Attack on Keyboards" (Harrison et al., 2023) using MBPWavs dataset, replacing CoAtNet with MaxViT-S for improved performance.
+- `dataset.py` : 완성 (키스트로크 분리 → 멜 스펙트로그램 → 증강 → DataLoader)
+- `model.py` : 삭제됨 → 재구현 필요
+- `train.py` : 삭제됨 → 재구현 필요
+- 데이터 : `MBPWavs/` — 0-9, A-Z (36개 키 × 25회 = 900 샘플)
 
 ---
 
-## Pipeline Summary
+## Phase 1: dataset.py 검토 및 수정
+
+**파일**: `dataset.py`
+
+**현황**: 이미 논문 전처리 파이프라인을 따름.  
+논문 설정과 일치 여부 최종 확인:
+
+| 파라미터 | 논문 | 현재 코드 | 조치 |
+|---|---|---|---|
+| 샘플 길이 | ~0.33 s | BEFORE=2400, AFTER=12000 → 14400 samples @ 44100 Hz ≈ 0.33 s | 일치, 유지 |
+| 멜 빈 | 64 | N_MELS=64 | 일치, 유지 |
+| FFT 윈도우 | 1024 | N_FFT=1024 | 일치, 유지 |
+| Hop Length | 225 | HOP_LENGTH=225 | 일치, 유지 |
+| 출력 크기 | 64×64 | TARGET_SIZE=64 | 일치 (pretrained 없이 64×64 사용) |
+| 채널 | 2 (stereo) | stereo 처리 후 (2, 64, 64) | 유지 |
+
+**수정 사항**:
+- `TARGET_SIZE = 64` 유지 (ConvNextV2는 FCN 구조라 임의 해상도 입력 가능)
+- 주석에서 "MaxViT-S" 참조 → "ConvNextV2" 로 교체
+
+---
+
+## Phase 2: model.py 구현
+
+**파일**: `model.py` (새로 작성)
+
+### ConvNextV2 Atto 아키텍처
+
+`timm` 라이브러리의 `convnextv2_atto` 사용.  
+사전학습 가중치 없이 처음부터 학습 (in_chans=2 이므로).
 
 ```
-WAV files → Keystroke Isolation → Time Shift Augmentation
-→ 2-Channel Audio → Mel-Spectrogram (64×64) → Resize 224×224
-→ SpecAugment → MaxViT-S (num_classes=36) → Train/Eval
+입력: (B, 2, 64, 64)
+  ↓ Stem (4×4 Conv, stride 4, →40ch) → (B, 40, 16, 16)
+  ↓ Stage 1 (2 blocks, 40ch)
+  ↓ Downsample → Stage 2 (2 blocks, 80ch)
+  ↓ Downsample → Stage 3 (6 blocks, 160ch)
+  ↓ Downsample → Stage 4 (2 blocks, 320ch)
+  ↓ GlobalAvgPool → LayerNorm → Linear(320, 36)
+출력: (B, 36) logits
 ```
 
+**ConvNextV2 블록 구조** (GRN 포함):
+```
+Depthwise 7×7 Conv → LayerNorm → Linear(4× expand) → GELU → GRN → Linear(1× project)
+```
+
+**GRN (Global Response Normalization)**:
+```
+X' = X * (X_norm / mean(X_norm))    where X_norm = L2-norm over spatial dims
+```
+
+**구현 방식**: `timm.create_model('convnextv2_atto', pretrained=False, in_chans=2, num_classes=36)`
+
+파라미터 수 목표: ~3.7M (CoAtNet 69M 대비 약 95% 절감)
+
 ---
 
-## Step 1: Data Loading
+## Phase 3: Gaussian Label Smoothing 구현
 
-**File:** `train.py`
+**파일**: `train.py` 내 `GaussianLabelSmoothingLoss` 클래스
 
-- Load all 36 `.wav` files from `MBPWavs/` (keys: 0-9, A-Z)
-- Use `librosa.load(path, sr=None, mono=False)` to preserve stereo (2 channels, 44100 Hz)
-- Label each file by its filename (e.g., `A.wav` → label `A`)
-- Map labels to integers: sort keys, assign 0–35
+### 키보드 2D 좌표 (QWERTY 기준 행/열 인덱스)
 
----
+```
+행 0 (숫자행): 0 1 2 3 4 5 6 7 8 9
+행 1 (Q행):    Q W E R T Y U I O P
+행 2 (A행):     A S D F G H J K L
+행 3 (Z행):      Z X C V B N M
+```
 
-## Step 2: Keystroke Isolation
+각 키에 (row, col) 좌표 할당 → 36×36 거리 행렬 D 사전 계산.
 
-**Reference:** `README.md` `isolator()` function
+### Soft Label 생성
 
-Parameters for MBP phone-recorded data:
+```
+target_dist[i][j] = exp(-D[i][j]² / (2σ²))
+target_dist[i] = target_dist[i] / sum(target_dist[i])   # 정규화
+```
+
+σ = 1.0 (키보드 격자 단위 — 인접 키에 적당한 확률 분배)
+
+### 손실 함수
+
 ```python
-isolator(
-    signal=samples_ch[:, 1*sample_rate:],  # skip first 1 sec
-    sample_rate=44100,
-    size=48,        # FFT size for energy detection
-    scan=24,        # hop for energy
-    before=2400,    # samples before peak
-    after=12000,    # samples after peak → total 14400 samples (0.33s)
-    threshold=prom,
-    show=False
+loss = F.kl_div(
+    F.log_softmax(logits, dim=-1),
+    soft_labels,          # Gaussian 분포로 만든 타겟
+    reduction='batchmean'
 )
 ```
 
-Adaptive threshold loop (Algorithm 1 in paper):
-```python
-prom = 0.06
-step = 0.005
-while len(strokes) != 25:
-    strokes = isolator(...)
-    if len(strokes) < 25: prom -= step
-    if len(strokes) > 25: prom += step
-    if prom <= 0: break
-    step *= 0.99
-```
-
-Apply independently to each stereo channel.
-
-**Output:** Per key: 25 keystrokes, each shape `(2, 14400)` (2 channels × 14400 samples)
-
 ---
 
-## Step 3: Data Augmentation & Preprocessing
+## Phase 4: train.py 구현
 
-Following the paper's pipeline (Figure 3 and Table 3):
+**파일**: `train.py` (새로 작성)
 
-### 3a. Time Shift Augmentation (applied at training time)
-- Randomly shift signal by up to ±40% of keystroke length
-- `shift = random.randint(-0.4 * 14400, 0.4 * 14400)`
-- Use `np.roll()` or slice-and-pad
+### 구성 요소
 
-### 3b. Mel-Spectrogram Generation
-For each of the 2 channels:
-```python
-librosa.feature.melspectrogram(
-    y=signal,
-    sr=44100,
-    n_mels=64,
-    n_fft=1024,
-    hop_length=225
-)
-# Convert to dB scale: librosa.power_to_db(S, ref=np.max)
+1. **옵티마이저**: AdamW (weight_decay=0.05)
+2. **스케줄러**: CosineAnnealingLR (T_max=epochs)
+3. **Mixed Precision**: `torch.cuda.amp.autocast` + `GradScaler`
+4. **체크포인트**: `checkpoints/best_model.pt` (val top-1 기준)
+5. **로깅**: epoch별 train_loss, val_loss, val_top1, val_top5
+
+### 하이퍼파라미터
+
+| 파라미터 | 값 | 근거 |
+|---|---|---|
+| Batch size | 32 | Colab T4 VRAM 15GB 기준 |
+| Epochs | 200 | 소규모 데이터셋 (900 샘플) |
+| Learning Rate | 1e-3 | 처음부터 학습 (no pretrained) |
+| Weight Decay | 0.05 | ConvNextV2 논문 권장값 |
+| σ (Gaussian) | 1.0 | 키보드 격자 단위 |
+| Warmup Epochs | 20 | Linear warmup |
+
+### 학습 루프 흐름
+
 ```
-- Output per channel: ~(64, 64) (crop/pad time axis to exactly 64)
-- Stack channels → shape `(2, 64, 64)`
-
-### 3c. Normalization
-- Normalize each spectrogram to [0, 1] or z-score normalize (paper: "Normalised Data: Yes")
-
-### 3d. Resize for MaxViT-S
-- MaxViT-S uses P=G=7 (block/grid partition size 7×7)
-- Minimum input for 4 downsampling stages with P=7: 224×224
-- Resize: `torchvision.transforms.Resize((224, 224))`
-- Shape: `(2, 224, 224)`
-
-### 3e. SpecAugment Masking (applied at training time only)
-- 2 masks per axis (time and frequency)
-- Each mask: random width up to 10% of axis → up to 6 pixels on 64-dim axis
-- Set masked region to mean value
-- Apply on the mel-spectrogram (before resize)
-
----
-
-## Step 4: Dataset Preparation
-
-Total samples: 36 keys × 25 keystrokes = **900 samples**
-
-Random split (paper: "Data Split: Random"):
-- Train: 80% → 720 samples
-- Validation: 10% → 90 samples
-- Test: 10% → 90 samples
-
-Use `torch.utils.data.Dataset` + `DataLoader`:
-```python
-DataLoader(dataset, batch_size=16, shuffle=True)
+for epoch in epochs:
+    train: forward → GaussianLoss → backward → optimizer.step
+    val:   forward → top1/top5 accuracy 계산
+    if val_top1 > best: save checkpoint
+    lr_scheduler.step()
 ```
 
 ---
 
-## Step 5: MaxViT-S Model
+## Phase 5: 평가 계획
 
-Use `timm` library for MaxViT-S implementation:
-```python
-import timm
-model = timm.create_model(
-    'maxvit_small_tf_224',
-    pretrained=False,     # train from scratch
-    num_classes=36,       # 36 keys
-    in_chans=2            # 2-channel mel-spectrogram
-)
-```
+논문 목표 성능과 비교:
 
-**MaxViT-S architecture** (from Table 11, MaxViT paper):
-| Stage | Output Size | Config |
-|-------|-------------|--------|
-| Stem  | 112×112     | 3×3 Conv ×2, C=64 |
-| S1    | 56×56       | MBConv C=96, Rel-MSA P=7 H=3, Grid-SA G=7 H=3, ×2 |
-| S2    | 28×28       | MBConv C=192, Rel-MSA P=7 H=6, Grid-SA G=7 H=6, ×2 |
-| S3    | 14×14       | MBConv C=384, Rel-MSA P=7 H=12, Grid-SA G=7 H=12, ×5 |
-| S4    | 7×7         | MBConv C=768, Rel-MSA P=7 H=24, Grid-SA G=7 H=24, ×2 |
-| Head  | 1×1         | Global Avg Pool → FC(36) |
-
-Total: ~69M parameters
+| 지표 | 논문 (CoAtNet) | 목표 (ConvNextV2) |
+|---|---|---|
+| Top-1 Accuracy | 95% | ≥ 90% |
+| Top-5 Accuracy | ~99% | ≥ 98% |
+| 파라미터 수 | 69M | ~3.7M |
+| Colab 학습 시간 | 불가 | 30분 이내 |
 
 ---
 
-## Step 6: Training
+## 구현 순서
 
-Hyperparameters from Table 3 (MacBook phone classifier):
-
-| Parameter | Value |
-|-----------|-------|
-| Epochs | 1100 |
-| Batch Size | 16 |
-| Loss | Cross Entropy |
-| Optimizer | Adam |
-| Max Learning Rate | 5e-4 |
-| LR Schedule | Linear decay |
-| Data Split | Random |
-
-Training loop:
-```python
-optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
-scheduler = torch.optim.lr_scheduler.LinearLR(
-    optimizer, start_factor=1.0, end_factor=0.0, total_iters=1100
-)
-criterion = nn.CrossEntropyLoss()
-
-for epoch in range(1100):
-    # train
-    model.train()
-    for batch in train_loader:
-        ...
-    scheduler.step()
-
-    # validate every 5 epochs
-    if epoch % 5 == 0:
-        model.eval()
-        ...
+```
+[1] dataset.py  — 주석 수정, TARGET_SIZE=64 확인           (소요: 10분)
+[2] model.py    — ConvNextV2 Atto 구현 (timm 활용)         (소요: 30분)
+[3] train.py    — GaussianLabelSmoothing + 학습 루프       (소요: 60분)
+[4] 로컬 sanity check — CPU로 1 epoch 돌려보기             (소요: 10분)
+[5] Colab 업로드 후 본 학습                               (소요: 30분)
 ```
 
 ---
 
-## Step 7: Evaluation
-
-- Log train loss, train accuracy, val accuracy per epoch
-- Save best model checkpoint (by validation accuracy)
-- Final test set evaluation:
-  - Top-1 accuracy
-  - Confusion matrix (36×36)
-  - Classification report (precision, recall, F1 per key)
-
----
-
-## File Structure
+## 디렉터리 구조 (완성 후)
 
 ```
-keyboard-acoustic-side-channel-attack-coatnet/
-├── MBPWavs/              # Raw .wav files
-├── train.py              # Main training script
-├── dataset.py            # Dataset class + preprocessing
-├── model.py              # MaxViT-S wrapper
+ASMR/
+├── MBPWavs/          # 원본 .wav 파일 (36개 키)
+├── checkpoints/      # 학습된 모델 가중치
+├── dataset.py        # 전처리 파이프라인
+├── model.py          # ConvNextV2 Atto 정의
+├── train.py          # 학습 루프 + Gaussian Label Smoothing
 ├── requirements.txt
-├── PLAN.md
-└── checkpoints/          # Saved model weights (auto-created)
+└── PLAN.md
 ```
-
----
-
-## Notes & Considerations
-
-1. **Small dataset (900 samples):** Time shift and SpecAugment augmentation are critical to prevent overfitting on 720 training samples.
-2. **MaxViT-S input size:** The original MaxViT-S was designed for 224×224. We resize 64×64 spectrograms to 224×224. Alternatively, use `timm.create_model('maxvit_small_tf_64', ...)` with custom partition size P=G=4 if timm supports it.
-3. **2-channel input:** `timm` automatically adapts the first conv layer when `in_chans=2`.
-4. **Training instability:** The paper found models could "collapse" around epoch 300–400 at LR=1e-3. Using LR=5e-4 + linear decay avoids this.
-5. **Convergence:** Based on the paper (Fig. 7), expect meaningful accuracy around epoch 200–300.
