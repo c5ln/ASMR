@@ -15,11 +15,11 @@ BEFORE        = 2400
 AFTER         = 12000
 KEYSTROKE_LEN = BEFORE + AFTER   # 14400 samples ≈ 0.33 s
 
-N_MELS         = 64
+N_MELS         = 128
 N_FFT          = 1024
-HOP_LENGTH     = 225
-N_TIME_FRAMES  = 64     # crop mel-spectrogram time axis to this
-TARGET_SIZE    = 224    # resize for MaxViT-S (needs ≥ 112 input)
+HOP_LENGTH     = 112
+N_TIME_FRAMES  = 128     # crop mel-spectrogram time axis to this
+TARGET_SIZE    = 128    # resize target (dataset_128.pt setting)
 
 TIMESHIFT_FRAC    = 0.4   # ± 40 %
 MASK_MAX_FRAC     = 0.1   # each mask up to 10 % of axis length
@@ -199,16 +199,17 @@ class KeystrokeDataset(Dataset):
         if self.mode == 'train':
             stroke = _time_shift(stroke)
 
-        # mel-spectrogram per channel → (2, 64, 64)
-        specs = np.stack([_melspec(stroke[c]) for c in range(stroke.shape[0])], axis=0)
+        # mel-spectrogram: L, R, mono → (3, 64, 64)
+        mono = (stroke[0] + stroke[1]) / 2
+        specs = np.stack([_melspec(stroke[0]), _melspec(stroke[1]), _melspec(mono)], axis=0)
 
         _normalize(specs)                   # in-place [0, 1]
-        specs = torch.from_numpy(specs)     # (2, 64, 64)
+        specs = torch.from_numpy(specs)     # (3, 64, 64)
 
         if self.mode == 'train':
             specs = _spec_augment(specs)
 
-        # resize to (2, TARGET_SIZE, TARGET_SIZE) for MaxViT-S
+        # resize to (3, TARGET_SIZE, TARGET_SIZE)
         specs = torch.nn.functional.interpolate(
             specs.unsqueeze(0),
             size=(TARGET_SIZE, TARGET_SIZE),
